@@ -1,3 +1,4 @@
+import axios, { type AxiosInstance } from 'axios';
 import type { WeatherService } from './weatherService';
 
 export interface LocationData {
@@ -7,12 +8,22 @@ export interface LocationData {
   lon: number;
 }
 
+interface SearchApiResult {
+  id: number;
+  name: string;
+  region: string;
+  country: string;
+  lat: number;
+  lon: number;
+}
+
 export class LocationService {
-  private weatherService: WeatherService;
-  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private client: AxiosInstance;
 
   constructor(weatherService: WeatherService) {
-    this.weatherService = weatherService;
+    // Access the underlying axios client to reuse the same base URL and API key
+    const ws = weatherService as unknown as { client: AxiosInstance };
+    this.client = ws.client;
   }
 
   async getCurrentLocation(): Promise<LocationData> {
@@ -23,16 +34,10 @@ export class LocationService {
       }
 
       navigator.geolocation.getCurrentPosition(
-        async (position) => {
-          try {
-            const location = await this.reverseGeocode(
-              position.coords.latitude,
-              position.coords.longitude,
-            );
-            resolve(location);
-          } catch (error) {
-            reject(error);
-          }
+        (position) => {
+          this.reverseGeocode(position.coords.latitude, position.coords.longitude)
+            .then(resolve)
+            .catch(reject);
         },
         (error) => {
           switch (error.code) {
@@ -59,40 +64,67 @@ export class LocationService {
       return [];
     }
 
-    return new Promise((resolve) => {
-      if (this.debounceTimer) {
-        clearTimeout(this.debounceTimer);
-      }
-
-      this.debounceTimer = setTimeout(async () => {
-        try {
-          const weather = await this.weatherService.getCurrentWeather(query);
-          resolve([
-            {
-              name: weather.location.name,
-              country: weather.location.country,
-              lat: weather.location.lat,
-              lon: weather.location.lon,
-            },
-          ]);
-        } catch {
-          resolve([]);
-        }
-      }, 300);
-    });
+    try {
+      const response = await this.client.get<SearchApiResult[]>('/search.json', {
+        params: { q: query.trim() },
+      });
+      return response.data.map((item) => ({
+        name: item.name,
+        country: item.country,
+        lat: item.lat,
+        lon: item.lon,
+      }));
+    } catch {
+      return [];
+    }
   }
 
   async reverseGeocode(lat: number, lon: number): Promise<LocationData> {
     try {
-      const weather = await this.weatherService.getCurrentWeather(`${lat},${lon}`);
+      const response = await this.client.get<SearchApiResult[]>('/search.json', {
+        params: { q: `${lat},${lon}` },
+      });
+
+      if (response.data.length === 0) {
+        throw new Error('No results found');
+      }
+
+      const result = response.data[0];
       return {
-        name: weather.location.name,
-        country: weather.location.country,
-        lat: weather.location.lat,
-        lon: weather.location.lon,
+        name: result.name,
+        country: result.country,
+        lat: result.lat,
+        lon: result.lon,
       };
-    } catch {
-      throw new Error('Failed to reverse geocode location');
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        throw new Error(`Failed to reverse geocode: ${error.message}`);
+      }
+      throw error;
     }
   }
+}
+
+export function debounceSearch(
+  service: LocationService,
+  delay = 300,
+): (query: string) => Promise<LocationData[]> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pendingReject: ((reason: string) => void) | null = null;
+
+  return (query: string): Promise<LocationData[]> => {
+    return new Promise((resolve, reject) => {
+      if (timer) {
+        clearTimeout(timer);
+        if (pendingReject) {
+          pendingReject('debounced');
+        }
+      }
+      pendingReject = reject;
+      timer = setTimeout(() => {
+        pendingReject = null;
+        service.searchCities(query).then(resolve).catch(reject);
+      }, delay);
+    });
+  };
 }
